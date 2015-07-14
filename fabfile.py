@@ -547,6 +547,20 @@ def add_firewall_service(service, permanent=True):
         sudo('firewall-cmd --add-service %s %s' % (service, p))
 
 
+def add_firewall_port(port, permanent=True):
+    """ adds a firewall rule """
+    yum_install(packages=['firewalld'])
+    from fabric.api import settings
+    from fabric.context_managers import hide
+
+    with settings(hide('warnings', 'running', 'stdout', 'stderr'),
+                warn_only=True, capture=True):
+        p = ''
+        if permanent:
+            p = '--permanent'
+        sudo('firewall-cmd --add-port %s %s' % (port, p))
+
+
 def update_grub():
     """ updates grub """
     green('updating grub...')
@@ -672,6 +686,9 @@ def get_image_id(image):
         result = sudo("docker images | grep %s | awk '{print $3}'" % image)
         return result
 
+def get_container_id(container):
+        result = sudo("docker ps -a | grep %s | awk '{print $1}'" % container)
+        return result
 
 def does_image_exist(image):
     from fabric.api import settings
@@ -687,16 +704,36 @@ def remove_image(image):
     sudo('docker rmi -f %s' % get_image_id(image))
 
 
+def remove_container(container):
+    sudo('docker rm -f %s' % get_container_id(container))
+
+
+def git_clone_grafana():
+    sudo('rm -rf graphite_docker')
+    sudo('git clone https://github.com/SamSaffron/graphite_docker.git')
+
+def build_grafana_image():
+    sudo('cd graphite_docker && docker build -t graphite .')
+
 @task
-def deploy_grafana_elk():
+def deploy_grafana():
+    if does_container_exist('data-platform'):
+        yellow('removing old data-platform container ...')
+        remove_container('graphite')
 
-    if does_container_exist('grafana_elk'):
-        yellow('removing old grafana_elk container ...')
-        sudo('docker rm -f grafana_elk')
+    if does_image_exist('graphite'):
+        yellow('removing old graphite image ...')
+        remove_image('graphite')
 
-    sudo('docker run -d -p 80:80  -p 81:81 -p 8125:8125/udp'
-         ' --name grafana_elk scullxbones/docker-grafana-statsd-elk')
+    git_clone_grafana()
+    build_grafana()
 
+    sudo('docker run --name graphite -it --rm -v `pwd`/data:/data '
+        '-p 14000:80 -p 14001:3000 -p 8125:8125/udp graphite')
+
+    add_firewall_port('14000/tcp')
+    add_firewall_port('14001/tcp')
+    add_firewall_port('8125/udp')
 
 def trial_as_root(*args):
     if args:
@@ -724,8 +761,8 @@ def it():
     execute(enable_firewalld_service, hosts=ec2_host)
     execute(install_docker, hosts=ec2_host)
     execute(create_docker_group, hosts=ec2_host)
-    execute(install_flocker, hosts=ec2_host)
-    execute(deploy_grafana_elk, hosts=ec2_host)
+    # execute(install_flocker, hosts=ec2_host)
+    execute(deploy_grafana, hosts=ec2_host)
 
 
 def main():
@@ -742,14 +779,14 @@ def main():
         exit(1)
 
     env.ec2_ami = os.getenv('AWS_AMI', 'ami-c7d092f7')
-    env.ec2_instance_name = 'aws_centos7'
+    env.ec2_instance_name = 'data-platform'
     env.ec2_instancetype = os.getenv('AWS_INSTANCE_TYPE', 't2.micro')
     env.ec2_key = os.environ['AWS_ACCESS_KEY_ID']
     env.ec2_key_filename = os.environ['AWS_KEY_FILENAME'] # path to ssh key
     env.ec2_key_pair = os.environ['AWS_KEY_PAIR']
     env.ec2_region = os.getenv('AWS_REGION', 'us-west-2')
     env.ec2_secret = os.environ['AWS_SECRET_ACCESS_KEY']
-    env.ec2_security = ['ssh', 'statsd', 'http'] # list of ec2 security groups
+    env.ec2_security = ['data-platform']
     env.flocker_BUILD_SERVER  = os.getenv('FLOCKER_BUILD_SERVER',
                                           'http://build.clusterhq.com')
     env.flocker_branch = os.getenv('FLOCKER_BRANCH', 'master')
