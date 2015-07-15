@@ -430,7 +430,7 @@ def install_development_packages():
     """ Update the kernel and install some development tools necessary for
      building the ZFS kernel module. """
     yum_install(packages = ["kernel-devel", "kernel", "kernel-headers",
-                "dkms", "gcc", "make", "psutils-perl", "lsof", "rsync"])
+                "dkms", "gcc", "git", "make", "psutils-perl", "lsof", "rsync"])
 
 
 def add_epel_yum_repository():
@@ -712,28 +712,32 @@ def git_clone_grafana():
     sudo('rm -rf graphite_docker')
     sudo('git clone https://github.com/SamSaffron/graphite_docker.git')
 
-def build_grafana_image():
-    sudo('cd graphite_docker && docker build -t graphite .')
+def build_metrics_platform_image():
+    sudo('cd graphite_docker && docker build -t metrics_platform_img .')
 
 @task
-def deploy_grafana():
-    if does_container_exist('data-platform'):
+def deploy_metrics_platform():
+    if does_container_exist('metrics_platform'):
         yellow('removing old data-platform container ...')
-        remove_container('graphite')
+        remove_container('metrics_platform')
 
-    if does_image_exist('graphite'):
-        yellow('removing old graphite image ...')
-        remove_image('graphite')
+    if does_image_exist('metrics_platform_img'):
+        yellow('removing old metrics_platform image ...')
+        remove_image('metrics_platform_img')
 
     git_clone_grafana()
-    build_grafana()
+    build_metrics_platform_image()
 
-    sudo('docker run --name graphite -it --rm -v `pwd`/data:/data '
-        '-p 14000:80 -p 14001:3000 -p 8125:8125/udp graphite')
+    sudo('test -e `pwd`/data || mkdir `pwd`/data')
+    sudo('chmod 777 `pwd`/data')
+    sudo('docker run -d --name metrics_platform -it -v `pwd`/data:/data '
+         '-p 14000:80 -p 14001:3000 -p 2003:2003 -p 8125:8125/udp'
+         ' metrics_platform_img')
 
     add_firewall_port('14000/tcp')
     add_firewall_port('14001/tcp')
     add_firewall_port('8125/udp')
+    add_firewall_port('2003/tcp')
 
 def trial_as_root(*args):
     if args:
@@ -762,7 +766,7 @@ def it():
     execute(install_docker, hosts=ec2_host)
     execute(create_docker_group, hosts=ec2_host)
     # execute(install_flocker, hosts=ec2_host)
-    execute(deploy_grafana, hosts=ec2_host)
+    execute(deploy_metrics_platform, hosts=ec2_host)
 
 
 def main():
