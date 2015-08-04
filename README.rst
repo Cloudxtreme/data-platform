@@ -1,4 +1,6 @@
 Code for deploying the data-platform
+This uses: https://github.com/SamSaffron/graphite_docker
+
 
 Usage:
 ------

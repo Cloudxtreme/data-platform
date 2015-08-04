@@ -20,11 +20,6 @@
 # AWS_ACCESS_REGION
 # AWS_SECRET_ACCESS_KEY
 
-# not yet in use:
-# FLOCKER_BUILD_SERVER
-# FLOCKER_BRANCH
-# FLOCKER_RPM_VERSION
-
 
 from fabric.api import sudo, local, warn_only, task, env, execute
 from subprocess import check_output
@@ -38,6 +33,9 @@ from urlparse import urljoin
 
 try:
     import boto.ec2
+    from boto.ec2.blockdevicemapping import BlockDeviceType
+    from boto.ec2.blockdevicemapping import BlockDeviceMapping
+    from boto.ec2.blockdevicemapping import EBSBlockDeviceType
 except:
     #  we assume we are running in a virtualenv
     install_python_module('boto')
@@ -112,12 +110,19 @@ def create_server():
         print(_green("Started..."))
         print(_yellow("...Creating EC2 instance..."))
 
+        # we need a larger boot device to store our cached images
+        dev_sda1 = EBSBlockDeviceType()
+        dev_sda1.size = 120
+        bdm = BlockDeviceMapping()
+        bdm['/dev/sda1'] = dev_sda1
+
         # get an ec2 ami image object with our choosen ami
         image = conn.get_all_images(env.ec2_ami)[0]
         # start a new instance
         reservation = image.run(1, 1,
                                 key_name=env.ec2_key_pair,
                                 security_groups=env.ec2_security,
+                                block_device_map = bdm,
                                 instance_type=env.ec2_instancetype)
 
         # and get our instance_id
@@ -413,19 +418,6 @@ def install_os_updates():
     sudo("yum -y --quiet update")
 
 
-def add_zfs_yum_repository():
-    """ adds the yum repository for ZFSonLinux """
-    from fabric.api import settings
-    from fabric.context_managers import hide
-
-    ZFS_REPO_PKG = (
-        "https://s3.amazonaws.com/archive.zfsonlinux.org/epel/"
-        "zfs-release" + arch() + ".noarch.rpm"
-
-    )
-    yum_install_from_url('zfs-release', ZFS_REPO_PKG)
-
-
 def install_development_packages():
     """ Update the kernel and install some development tools necessary for
      building the ZFS kernel module. """
@@ -449,82 +441,12 @@ def arch():
     return result
 
 
-def clusterhq_repo_url():
-    """ returns the correct clusterhq yum repository url """
-    clusterhq_repo_url = (
-        'https://s3.amazonaws.com/clusterhq-archive/centos/'
-        "clusterhq-release" + arch() + ".noarch.rpm")
-    return clusterhq_repo_url
-
-
-def add_clusterhq_yum_repository():
-    """ Install a repository that provides the flocker binaries """
-    yum_install_from_url('clusterhq-release', clusterhq_repo_url())
-
-
-def add_build_branch_yum_repository():
-    """ Install a repository that provides a specific set of binaries
-        from a build branch
-    """
-    from fabric.contrib.files import append
-    branch = env.flocker_branch
-    build_server = env.flocker_BUILD_SERVER
-    # If a branch is specified (defaults to master),
-    # add a repo pointing at the buildserver repository corresponding
-    # to that branch.
-    # This repo will be disabled by default.
-    result_path = os.path.join('/results/omnibus', branch,
-                            'centos-$releasever')
-    base_url = urljoin(build_server, result_path)
-    text = ['[clusterhq-build]',
-            'name=clusterhq-build',
-            'baseurl=%s' % base_url,
-            'gpgcheck=0',
-            'enabled=0']
-
-    append('/etc/yum.repos.d/clusterhq-build.repo',
-            text,
-            use_sudo=True,
-            shell=True)
-
-
 def create_docker_group():
     """ creates the docker group """
     from fabric.contrib.files import contains
 
     if not contains('/etc/group', 'docker', use_sudo=True):
         sudo("groupadd docker")
-
-
-def install_zfs():
-    """ installs ZFSonLinux """
-    add_zfs_yum_repository()
-    yum_install(packages=["zfs"])
-
-
-def install_flocker():
-    """ installs Flocker """
-    rpm_version = env.flocker_rpm_version
-    branch_opt = env.flocker_branch
-
-    add_clusterhq_yum_repository()
-    add_build_branch_yum_repository()
-    # If a version is specifed, install that version.
-    # Otherwise install whatever yum decides.
-    if rpm_version:
-        # The buildserver doesn't build dirty versions,
-        # so strip that.
-        if rpm_version.endswith('.dirty'):
-            rpm_version = rpm_version[:-len('.dirty')]
-        packages = ['clusterhq-flocker-node-%s' % (rpm_version),
-                    'clusterhq-flocker-client-%s' % (rpm_version)]
-    else:
-        packages = ['clusterhq-flocker-node', 'clusterhq-flocker-cli']
-
-    yum_install(packages=packages)
-    # configures the firewall for the flocker services
-    for svc in ['flocker-control-api', 'flocker-control-agent']:
-        add_firewall_service(svc)
 
 
 def enable_firewalld_service():
@@ -560,26 +482,6 @@ def add_firewall_port(port, permanent=True):
             p = '--permanent'
         sudo('firewall-cmd --add-port %s %s' % (port, p))
 
-
-def update_grub():
-    """ updates grub """
-    green('updating grub...')
-    sudo('grub2-mkconfig -o /boot/grub2/grub.cfg')
-
-
-def grub2_fix_floc_235():
-    """ fixes an issue related to FLOC-235 """
-    green('applying fix for FLOC-235...')
-    from fabric.contrib.files import append, contains
-
-    if not contains('/etc/default/grub',
-        text='GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} elevator=noop"\n'):
-        append('/etc/default/grub',
-            'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} elevator=noop"\n',
-                use_sudo=True, partial=True, shell=True)
-        update_grub()
-
-
 @task
 def ssh(*cli):
     from itertools import chain
@@ -588,26 +490,6 @@ def ssh(*cli):
     local('ssh -t -i %s %s@%s %s' % (env['ec2_key_filename'],
                                env['user'], data['ip_address'],
                                "".join(chain.from_iterable(cli))))
-
-
-def create_zfs_storage_pool(name='flocker',
-    filebased=True, dev='/var/opt/flocker', size='1G'):
-    """
-        creates a zfs storage pool, defaults to use a file backed vdevs.
-        p name: name of the zpool
-        p filebased: True|False weather this zpool is using file backed vdevs
-        p size: size of the file vdev
-        p dev: device file for real disk devices,
-         or directory for file backed vdevs
-    """
-    if filebased:
-        from fabric.contrib.files import exists
-        if not exists(dev):
-            green('creating zfs storage pool ...')
-            sudo('mkdir -p %s' % dev)
-        if not exists(dev + '/pool-vdev'):
-            sudo('truncate --size %s %s/pool-vdev' % (size, dev))
-            sudo('zpool create flocker %s/pool-vdev' % dev )
 
 
 def install_docker():
@@ -662,14 +544,6 @@ def check_for_missing_environment_variables():
         return True
 
 
-def trial(*args):
-    if args:
-        from itertools import chain
-        ssh('/opt/flocker/bin/trial ', args)
-    else:
-        yellow("give me a test to run, ex: fab trial:'flocker'")
-
-
 def does_container_exist(container):
     from fabric.api import settings
     with settings(warn_only=True):
@@ -699,14 +573,11 @@ def does_image_exist(image):
         else:
             return False
 
-
 def remove_image(image):
     sudo('docker rmi -f %s' % get_image_id(image))
 
-
 def remove_container(container):
     sudo('docker rm -f %s' % get_container_id(container))
-
 
 def git_clone_grafana():
     sudo('rm -rf graphite_docker')
@@ -739,13 +610,6 @@ def deploy_metrics_platform():
     add_firewall_port('8125/udp')
     add_firewall_port('2003/tcp')
 
-def trial_as_root(*args):
-    if args:
-        from itertools import chain
-        ssh('sudo /opt/flocker/bin/trial ', args)
-    else:
-        yellow("give me a test to run, ex: fab trial:'flocker'")
-
 
 @task
 def it():
@@ -765,7 +629,6 @@ def it():
     execute(enable_firewalld_service, hosts=ec2_host)
     execute(install_docker, hosts=ec2_host)
     execute(create_docker_group, hosts=ec2_host)
-    # execute(install_flocker, hosts=ec2_host)
     execute(deploy_metrics_platform, hosts=ec2_host)
 
 
@@ -791,10 +654,6 @@ def main():
     env.ec2_region = os.getenv('AWS_REGION', 'us-west-2')
     env.ec2_secret = os.environ['AWS_SECRET_ACCESS_KEY']
     env.ec2_security = ['data-platform']
-    env.flocker_BUILD_SERVER  = os.getenv('FLOCKER_BUILD_SERVER',
-                                          'http://build.clusterhq.com')
-    env.flocker_branch = os.getenv('FLOCKER_BRANCH', 'master')
-    env.flocker_rpm_version = os.getenv('FLOCKER_RPM_VERSION', '')
     env.user = 'centos'
     env.disable_known_hosts = True
     env.key_filename = env.ec2_key_filename
